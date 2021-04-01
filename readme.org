@@ -1,0 +1,168 @@
+#+TITLE: Getting started with Sinara Stabilizer
+
+  - Hardware :: [[https://github.com/sinara-hw/Stabilizer/][sinara-hw/Stabilizer]]
+  - Firmware :: [[https://github.com/quartiq/stabilizer][quartiq/stabilizer]]
+  - Firmware revision for this document :: [[https://github.com/quartiq/stabilizer/commit/e92c2bd76c6f1a4257599f1ef371f505cec442fa][e92cdbd]]
+
+* Preparation
+
+** MQTT broker
+
+Stabilizer is configured and monitored over MQTT. You therefore need a running MQTT broker. [[https://mosquitto.org/][mosquitto]] is a common choice that is [[https://repology.org/project/mosquitto/packages][packaged]] in multiple distributions.
+
+The (unsecure) configuration file (probably =/etc/mosquitto/mosquitto.conf=) can be as simple as:
+
+#+begin_src conf
+  # listen on port 1883 (default unsecure-mqtt port)
+  listener 1883
+
+  # logger configuration (e.g. for systemd)
+  log_dest syslog
+  log_type error
+  log_type warning
+
+  # recommended for debug
+  log_type notice
+  log_type information
+#+end_src
+
+If you run systemd, you can launch the service with:
+
+#+begin_src bash
+  systemctl start mosquitto
+#+end_src
+
+When debugging, it may be useful to subscribe to all Stabilizer-related topics:
+
+#+begin_src bash
+  mosquitto_sub -h <broker address> -v -t "dt/sinara/stabilizer/#"
+#+end_src
+
+** Powering the board
+
+The Stabilizer board can be powered through:
+
+  - the EEM connector, e.g. from Kasli or Humpback
+  - the back-side 12V barrel connector (< 500 mA, pin positive)
+  - PoE (IEEE 802.3) on the front-panel's RJ45 connector
+
+** Get the microcontroller firmware
+
+The easiest is to get a prebuilt microcontroller firmware from the [[https://nixbld.m-labs.hk/job/mcu/mcu/stabilizer-dual-iir][M-Labs build server]]. Select the latest successful build and download the output =dual-iir.bin=. However, this uses the hard-coded IP address =10.34.16.10= for the MQTT broker.
+
+To build the firmware manually:
+
+  1. Get a working rust ecosystem (e.g. [[https://repology.org/project/rustup/packages][rustup]])
+  2. Clone, adjust, and build:
+
+  #+begin_src bash
+    git clone https://github.com/quartiq/stabilizer
+    cd stabilizer
+
+    # EDIT src/hardware/design_parameters.rs
+    # and adjust the MQTT_BROKER constant to your infrastructure
+
+    rustup target add thumbv7em-none-eabihf
+    cargo build --release
+  #+end_src
+
+** Flash the microcontroller firmware
+
+The project's [[https://github.com/quartiq/stabilizer/#minimal-bootstrapping-documentation][README]] lists multiple methods to flash the firmware on the microcontroller. USB-DFU has the advantage to not require other hardware than a micro-USB cable. The procedure is reproduced here for completeness:
+
+  1. Install [[https://repology.org/project/dfu-util/packages][dfu-util]]
+  2. Install =cargo-binutils= (e.g. =cargo install cargo-binutils=)
+  3. Connect the USB cable to the micro-USB connector next to the RJ45 and the host
+  4. Short =JC2/BOOT=, next to the STM32 on the Stabilizer board
+  5. Power the board, check that the DFU bootloader is detected on the host (e.g. =dfu-util -l=)
+  6. Build & flash the firmware:
+
+  #+begin_src bash
+    cargo objcopy --release --bin dual-iir -- -O binary dual-iir.bin
+    dfu-util -a 0 -s 0x08000000:leave -D dual-iir.bin
+  #+end_src
+
+  7. Open =JC2/BOOT=, cycle power. The newly flashed firmware should boot.
+
+
+* Usage
+
+** Dual-IIR
+
+The firmware repo's README has a block diagram of the design. There are two independent signal processing chains with:
+
+  - programmable-gain analog front-ends (AFE)
+  - programmable cascaded digital [[https://en.wikipedia.org/wiki/Digital_biquad_filter][biquadratic]] [[https://en.wikipedia.org/wiki/Infinite_impulse_response][IIR]] filters
+
+The number of cascaded filters is hard-coded as the constant =IIR_CASCADE_LENGTH= in =src/bin/dual-iir.rs=.
+
+Processing blocks parameters are set by publishing values to defined MQTT topics of the form =dt/sinara/stabilizer/settings/<path>=. The reference implementation in =miniconf.py= splits between the prefix (=dt/sinara/stabilizer=) and the settings path. The values must be valid JSON. The device answers with topics of the form =dt/sinara/stabilizer/response/<path>=.
+
+*** Input gain control
+
+  - path :: =afe/n= where =n= is =0= or =1= (labels the two DSP chains)
+  - values :: ="G1"=, ="G2"=, ="G5"=, ="G10"=
+
+*** IIR 
+
+  - path :: =iir_ch/n/m= where =n= labels the DSP chain (=0= or =1=) and =m= the biquad filter (=0= or =1=, the latter only if =IIR_CASCADE_LENGTH= is =2=)
+  - values :: ={"y_offset": y0, "y_min": ym, "y_max": yM, "ba": [b0, b1, b2, -a1, -a2]}= (see below)
+
+**** Saturation and offset
+
+The IIR cores use signed 16-bit integers, so the full-scale is =(1 << 15) - 1 = 32767=. Saturation and offset parameters are given in this scale: =y (code) = y (volts) * 32767 / 10=
+
+  - =y_min= :: lower saturation limit
+  - =y_max= :: upper saturation limit
+  - =y_offset= :: output offset
+
+**** IIR parameters
+
+An quick overview of digital bi-quadratic IIR filters can be found in [[https://arxiv.org/abs/1508.06319][Leibrandt and Heidecker, 2015]] (appendix). There, Table III is a catalog of common filters in terms of normalized IIR coefficients, as expected by Stabilizer.
+
+The sampling frequency can be calculated from the constants in =design_parameters.rs=:
+
+  Sampling frequency = =TIMER_FREQUENCY= / =ADC_SAMPLE_TICKS= = 100 MHz / 128 ≅ 780 kHz
+
+such that the sampling time is roughly 1.3 µs.
+
+The [[file:filter_design.py][filter_design]] module in this repository contains routines to get started. It implements the filters described in [[https://arxiv.org/abs/1508.06319][Leibrandt and Heidecker, 2015]] as well as a somewhat clunky interface on top of some IIR filter design routines from =scipy.signal=.
+
+The module requires recent versions of =numpy=, =scipy=, and =sympy=. =miniconf.py=, from the Stabilizer [[https://github.com/quartiq/stabilizer][firmware repository]], must be in the Python load path.
+
+When run as a script, it allows to easily update the IIR filter settings on Stabilizer. Examples include:
+
+#+begin_src bash
+  # pass-through on ADC0/DAC0
+  python filter_design.py -b <broker address> lib P K=1
+
+  # pass-through on ADC1/DAC1
+  python filter_design.py -b <broker address> -c 1 lib P K=1
+
+  # same, but with 2V output offset
+  python filter_design.py -b <broker address> -c 1 --y-offset 2. lib P K=1
+
+  # gain-limited PI filter
+  python filter_design.py -b <broker address> lib PI K=1 f0=50e3 g=100
+
+  # 10 kHz (3dB) bandwidth notch at 30 kHz
+  python filter_design.py -b <broker address> lib NOTCH K=1 Q=3 f0=30e3
+
+  # same, but using scipy.signal.iirnotch
+  python filter_design.py -b <broker address> scipy iirnotch K=1 Q=3 f0=30e3
+
+  # 4th order type-2 Chebyshev low-pass filter
+  # 40 dB attenuation in the stop-band, 30 kHz corner
+  python filter_design.py -b <broker address> scipy cheby2 N=4 rs=40 Fn=30e3 K=30 btype=low
+
+  # 2nd order Butterworth high-pass filter, 50 kHz corner
+  python filter_design.py -b <broker address> scipy butter N=2 Fn=50e3 K=10 btype=high
+#+end_src
+
+** Lockin
+
+TODO
+
+** Pounder support
+
+TODO
